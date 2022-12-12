@@ -1,0 +1,192 @@
+---    
+title: "Disease Mapping"
+output: pdf_document
+date: "12/12/2022"
+author: "Zaira García, Luis Requeni y Celia Sifre"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, eval = T, warning = F, message = F)
+```
+
+```{r librerias, echo=F}
+library(formatR)
+library(graph)
+library(gridExtra)
+library(INLA)
+library(lattice)
+library(latticeExtra)
+library(maptools)
+library(R2WinBUGS)
+library(RColorBrewer)
+library(Rgraphviz)
+library(rgdal)
+library(spdep)
+library(viridis)
+```
+
+El principal objetivo de este estudio es valorar la mortalidad por enfermedad isquémica en hombres en la comunidad autónoma de Aragón durante el periodo 1991-2000. Para ello, realizaremos un mapeo de la isquemia en dicha comunidad. Disponemos de una base de datos que contiene el número de casos esperados y observados por municipio.
+
+En primer lugar, crearemos la estructura de directorios inicial del proyecto que facilite su reproducibilidad para el usuario interesado.
+
+```{r Directorio}
+dir.create("r")
+dir.create("figuras")
+dir.create("informes")
+dir.create("datos")
+dir.create("datos/brutos")
+dir.create("datos/procesados")
+```
+
+A continuación, cargaremos los datos y definiremos la relación de vecindad entre los distintos municipios. En concreto, la relación de vecindad que escogeremos será por contigüidad.
+
+```{r Datos}
+load(file.path("..", "datos", "procesados", "Aragon.Rdata"))
+aragon.shp <- readOGR(file.path("..", "datos", "procesados", "aragon.shp"))
+
+aragon.shp <- aragon.shp[order(aragon.shp$CODMUNI), ]
+aragon.nb <- poly2nb(aragon.shp)
+vecinos <- nb2WB(aragon.nb)
+paleta <- colorRampPalette(brewer.pal(9, 'Blues'))(5)
+```
+
+Nuestra variable respuesta $O_i$ representa los casos observados por enfermedad isquémica en hombres. Por tanto, tenemos una variable cuantitativa discreta y se distribuye como una Poisson de parámetro $\lambda$:
+$$ O_i \sim \text{Po}(\lambda_i).$$
+
+Para realizar dicha modelización, utilizaremos la propuesta de Besag, York y Mollié para el análisis espacial de riesgos en áreas pequeñas. Implementaremos este modelo tanto en WinBUGS como en INLA.
+
+\newpage
+
++ **WinBUGS**
+
+```{r Modelo Winbugs (1)}
+modelo <- function()
+{
+  for(i in 1:n){
+    O[i] ~ dpois(mu[i])
+    log(mu[i]) <- log(E[i]) + m + het[i] + sp[i]
+    het[i] ~ dnorm(0, prechet)
+    R[i] <- exp(m + het[i] + sp[i])
+  }
+  sp[1:n] ~ car.normal(adj[], w[], num[], precsp)
+  m ~ dflat()
+  prechet <- pow(sdhet, -2)
+  precsp <- pow(sdsp, -2)
+  sdhet ~ dunif(0, 10)
+  sdsp ~ dunif(0, 10)
+}
+```
+
+```{r Modelo Winbugs (2), eval=F}
+set.seed(123)
+
+datos <- list(E = Aragon.df$E, O = Aragon.df$O, n = dim(Aragon.df)[1],
+              adj = vecinos$adj, w = vecinos$weights, num = vecinos$num)
+parametros <- c("mu", "sdhet", "sdsp", "m", "R")
+iniciales <- function()
+{
+  list(sdhet = runif(1), sdsp = runif(1), m = rnorm(1))
+}
+iteraciones <- 20000
+burnin <- 2000
+
+ajuste.modelo <- bugs(model = modelo, inits = iniciales, data = datos, 
+                      parameters.to.save = parametros, 
+                      n.iter = iteraciones, n.burnin = burnin)
+save(ajuste.modelo, file = "ajuste.modelo.rda")
+```
+
+Hemos realizado un total de 20000 iteraciones y eliminamos las 2000 primeras para asegurar la convergencia en dicha simulación.
+
+```{r Modelo Winbugs (3), echo=F}
+load(file.path("..", "r", "ajuste.modelo.rda"))
+```
+
+Representaremos el SMR de la isquemia en hombres estimado por nuestro modelo.
+
+```{r Modelo Winbugs (4), echo=F}
+plot(aragon.shp, col = paleta[findInterval(ajuste.modelo$mean$R, 
+                                           c(0, 0.6, 0.9, 1, 1.1, 1.8))])
+title("SMR ")
+legend("bottomright", c("0 - 0.6", "0.6 - 0.9", "0.9 - 1", "1 - 1.1", "1.1 - 1.8"), 
+       fill = paleta, cex = 0.7)
+```
+
++ **INLA**
+
+```{r Modelo INLA (1)}
+Nareas <- length(Aragon.df[, 1])
+temp <- poly2nb(aragon.shp)
+nb2INLA(file.path("..", "figuras", "LDN.graph"), temp)
+
+H <- inla.read.graph(filename = file.path("..", "figuras", "LDN.graph"))
+S <- U <- seq(1, 729)
+data <- cbind(Aragon.df, S, U)
+formula <- O ~ 1 + f(S, 
+                     model = "besag", 
+                     graph = H,
+                     scale.model = TRUE,
+                     hyper = list(prec = list(prior = "loggamma", param = c(1, 0.001)))) +
+                   f(U, 
+                     model = "iid", 
+                     hyper = list(prec = list(prior = "loggamma", param = c(1, 0.001))))
+
+modelo.inla <- inla(formula,
+                    family = "poisson",
+                    data = Aragon.df,
+                    E = E,
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.predictor = list(compute = TRUE, cdf = c(log(1))))
+summary(modelo.inla)
+```
+
+\newpage
+
+Representaremos tanto el SMR como la probabilidad de que el SMR sea mayor que 1 de la isquemia en hombres estimado por nuestro modelo.
+
+```{r Modelo INLA (2), fig.height=3}
+aragon.shp$SMR_mean <- modelo.inla$summary.fitted.values$mean # Media
+aragon.shp$SMR_sd <- modelo.inla$summary.fitted.values$sd # Desviación tipica
+aragon.shp$SMR_p1 <- 1 - modelo.inla$summary.fitted.values$`1 cdf` # Probabilidad de ser mayor que 1
+
+SMR.cutoff <- c(0.6, 0.9, 1.0, 1.1, 1.8)
+SMR_p1.cutoff <- c(0, 0.2, 0.8, 1)
+SMR_disc <- cut(aragon.shp$SMR_mean,
+               breaks = SMR.cutoff,
+               include.lowest = TRUE)
+SMR_p1_disc <- cut(aragon.shp$SMR_p1,
+                  breaks         = SMR_p1.cutoff,
+                  include.lowest = TRUE)
+
+aragon.shp$SMR_disc <- SMR_disc
+aragon.shp$SMR_p1_disc <- SMR_p1_disc
+grid.arrange(spplot(aragon.shp,
+                    c("SMR_disc"),
+                    col.regions = brewer.pal(9, 'Blues')[c(2, 4, 6, 8)],
+                    main = "SMR",
+                    par.settings = list(axis.line = list(col = 'transparent'))),
+             spplot(aragon.shp,
+                    c("SMR_p1_disc"),
+                    col.regions = brewer.pal(9, 'Blues')[c(3, 6, 9)],
+                    main = "p(SMR > 1)",
+                    par.settings = list(axis.line = list(col =  'transparent'))), ncol = 2)
+```
+
+\newpage
+
+# Conclusiones
+
+A la vista de los resultados ofrecidos por ambas técncias, podemos concluir que parece existir un mayor SMR en los municipios cercanos al río Ebro. Ello hace pensar en la presencia de algun fáctor en esas zonas que influya en los casos de isquemia. Aunque sin fundamento objetivo alguno, podríamos apostar a que la alta actividad industrial de la zona puede ser la responsable de ello.
+
+Para facilitar su reproducibilidad, hemos creado un proyecto en R incluyendo la creación de los distintos archivos que facilite la organización de la información. El informe se ha desarrollado a través de un fichero de RmarkDown permitiendo al mismo tiempo la programación y ejecución de comandos a través de R así como la edición del texto en un formato amigable.
+
+En este sentido utilizamos igualmente rutas de archivos relativas que permiten que cualquier usuario con su ordenador y abriendo el proyecto puede utilizar los distintos archivos y ficheros de manera sencilla. Igualmente, hacemos uso de la función *file.path()* que soluciona los problemas que pueda haber en cuanto a los subdirectorios según se trabaje con Windows, MAC u otro sistema operativo. Finalmente, como la ubicación del programa WinBUGS puede ser distinta en cada ordenador, hemos guardado el objeto resultante (*ajuste.modelo*) para que posteriormente el usuario puede cargarlo sin necesidad de correr el modelo él mismo, ganando así también carga computacional.
+
+Finalmente, para el cuidado de la sintaxis nos hemos apoyado en la libraria *formatR*, donde utilizando la función *tidy_file*, corregimos posibles fallos sintácticos así como otorgamos del estilo adecuado a nuestro script.
+
+```{r, eval=F, include=T}
+tidy_file(file.path("..", "r", "PracticaCartografiaEnfermedades.R"))
+```
+
+
+
